@@ -268,6 +268,8 @@ func getActivity() (activity discordrpc.Activity, err error) {
 		return
 	}
 
+	activity.Type = 3
+
 	// Idle
 	if mediaInfo.idle {
 		activity.SmallImageKey = imageIdle
@@ -299,7 +301,6 @@ func getActivity() (activity discordrpc.Activity, err error) {
 	}
 
 	// State
-	activity.Type = 3
 	if mediaInfo.mediaType == "episode" && mediaInfo.showTitle != "" {
 		activity.State = fmt.Sprintf("S%02dE%02d - %s", mediaInfo.showSeason, mediaInfo.showEpisode, mediaInfo.showTitle)
 	} else if mediaInfo.mediaType == "movie" && mediaInfo.title != "" {
