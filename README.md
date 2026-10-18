@@ -29,19 +29,19 @@ Discord Rich Presence Integration for [Plex Desktop](https://www.plex.tv/en-ca/m
 
 ## Installation
 
-Installer scripts for Windows, Linux and OSX are provided.
+Installer scripts for Windows and Linux are provided.
 
 1. Download .zip from [the latest release](https://github.com/Glitchtest51/plex-discord-rpc/releases) and extract it.
 2. Run the installer script of your platform.
     * **MacOS**: not sure, pr or issue if you know
-    **Linux**: not sure, pr or issue if you know
-    * **Windows**: run `install_windows.bat` by double clicking on it for Windows
+    **Linux Flatpak**: run `install_flatpak.sh`
+    * **Windows**: run `install_windows.bat`
 
 ## Configurations
 
-For OSX and Linux, config file is located in `not sure, pr or issue if you know`.
-
 For Windows, config file is located at `%localappdata%\Plex\script-opts`.
+
+For Linux, if Plex is installed via Flatpak, the config is located at `~/.var/app/tv.plex.PlexDesktop/data/plex/script-opts`.
 
 * **key** (default: `D`): key binding to toggle activation on the fly
 * **active** (default: `yes`): whether to activate at launch

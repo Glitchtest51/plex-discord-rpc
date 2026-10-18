@@ -37,7 +37,7 @@ def copy_plugin(target_name):
     scripts = {
         "windows": "install_windows.bat",
         "macos": "install_darwin.sh",
-        "linux": "install_linux.sh",
+        "linux": "install_flatpak.sh",
     }
     script = os.path.join("install_scripts", scripts[target_name])
     if os.path.exists(script):
