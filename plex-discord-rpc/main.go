@@ -15,6 +15,7 @@ import (
 	"plex-discord-rpc/mpvipc"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -44,6 +45,9 @@ type plexMediaItem struct {
 		MetadataItem struct {
 			Title            string `json:"title"`
 			ServerEntityID   string `json:"serverEntityID"`
+			Guid             string `json:"guid"`
+			GrandparentGuid  string `json:"grandparentGuid"`
+			ParentGuid       string `json:"parentGuid"`
 			Thumb            string `json:"thumb"`
 			Index            int    `json:"index"`
 			Type             string `json:"type"`
@@ -82,10 +86,140 @@ type plexResource struct {
 	} `json:"connections"`
 }
 
+type plexMetadataResponse struct {
+	MediaContainer struct {
+		Metadata []struct {
+			Thumb string `json:"thumb"`
+		} `json:"Metadata"`
+	} `json:"MediaContainer"`
+}
+
 var (
 	client   *mpvipc.Client
 	presence *discordrpc.Presence
+
+	thumbURLCache = make(map[string]cachedThumb)
+	thumbCacheMux sync.Mutex
+	httpClient    = &http.Client{Timeout: 5 * time.Second}
 )
+
+type cachedThumb struct {
+	url    string
+	expiry time.Time
+}
+
+func getPublicThumbURL(guid string, plexUAT string, plexClientID string) string {
+	if !strings.HasPrefix(guid, "plex://") {
+		return ""
+	}
+
+	cacheKey := guid
+	now := time.Now()
+	thumbCacheMux.Lock()
+	pruneExpiredThumbCache(now)
+	if cached, ok := thumbURLCache[cacheKey]; ok && now.Before(cached.expiry) {
+		thumbCacheMux.Unlock()
+		return cached.url
+	}
+	thumbCacheMux.Unlock()
+
+	parts := strings.Split(guid, "/")
+	if len(parts) < 3 {
+		return ""
+	}
+	id := parts[len(parts)-1]
+
+	req, e := http.NewRequest("GET", "https://metadata.provider.plex.tv/library/metadata/"+id, nil)
+	if e != nil {
+		return ""
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Plex-Product", largeImageText)
+	req.Header.Set("X-Plex-Token", plexUAT)
+	req.Header.Set("X-Plex-Client-Identifier", plexClientID)
+
+	res, e := httpClient.Do(req)
+	if e != nil {
+		return ""
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return ""
+	}
+
+	var metadata plexMetadataResponse
+	if e = json.NewDecoder(res.Body).Decode(&metadata); e != nil {
+		return ""
+	}
+
+	if len(metadata.MediaContainer.Metadata) > 0 {
+		thumb := metadata.MediaContainer.Metadata[0].Thumb
+		thumbURL := ""
+		if strings.HasPrefix(thumb, "http") {
+			thumbURL = thumb
+		} else if strings.HasPrefix(thumb, "/") {
+			thumbURL = "https://metadata-static.plex.tv" + thumb
+		}
+		if thumbURL != "" {
+			thumbCacheMux.Lock()
+			thumbURLCache[cacheKey] = cachedThumb{
+				url:    thumbURL,
+				expiry: time.Now().Add(10 * time.Minute),
+			}
+			thumbCacheMux.Unlock()
+			return thumbURL
+		}
+	}
+	return ""
+}
+
+func getMediaServerToken(media plexMediaItem, plexUAT string, plexClientID string, host string) string {
+	req, e := http.NewRequest("GET", "https://clients.plex.tv/api/v2/resources?includeHttps=1", nil)
+	if e != nil {
+		return ""
+	}
+
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Plex-Product", largeImageText)
+	req.Header.Set("X-Plex-Token", plexUAT)
+	req.Header.Set("X-Plex-Client-Identifier", plexClientID)
+
+	res, e := http.DefaultClient.Do(req)
+	if e != nil {
+		return ""
+	}
+
+	defer res.Body.Close()
+
+	var response []plexResource
+	e = json.NewDecoder(res.Body).Decode(&response)
+	if e != nil {
+		return ""
+	}
+
+	var token = ""
+	for i := range response {
+		if strings.Contains(response[i].Provides, "server") {
+			if strings.Contains(media.Decision.MetadataItem.ServerEntityID, response[i].ClientIdentifier) {
+				token = response[i].AccessToken
+				break
+			}
+
+			for _, c := range response[i].Connections {
+				u, _ := url.Parse(c.URI)
+				if u.Host == host {
+					token = response[i].AccessToken
+					break
+				}
+			}
+
+			if token != "" {
+				break
+			}
+		}
+	}
+	return token
+}
 
 func UploadToLitterbox(imageURL string, timeOption string) (string, time.Time, error) {
 	resp, err := http.Get(imageURL)
@@ -150,6 +284,14 @@ func UploadToLitterbox(imageURL string, timeOption string) (string, time.Time, e
 	expiration := time.Now().Add(duration)
 
 	return uploadedURL, expiration, nil
+}
+
+func pruneExpiredThumbCache(now time.Time) {
+	for key, entry := range thumbURLCache {
+		if entry.expiry.Before(now) {
+			delete(thumbURLCache, key)
+		}
+	}
 }
 
 func getMediaInfo() (info mediaInfo, err error) {
@@ -259,96 +401,82 @@ func getMediaInfo() (info mediaInfo, err error) {
 	}
 
 	if media.URL != "" && plexUAT != "" && plexClientID != "" && !metadataItem.IsAdult {
-		parsed, e := url.Parse(media.URL)
-		if e != nil {
-			return
+		// Public Plex Artwork
+		var thumbPath string
+		var lookupGuid string
+
+		switch metadataItem.Type {
+		case "episode":
+			if strings.HasPrefix(metadataItem.ParentGuid, "plex://") && metadataItem.ParentThumb != "" {
+				thumbPath = metadataItem.ParentThumb
+				lookupGuid = metadataItem.ParentGuid
+			} else if strings.HasPrefix(metadataItem.GrandparentGuid, "plex://") &&metadataItem.GrandparentThumb != "" {
+				thumbPath = metadataItem.GrandparentThumb
+				lookupGuid = metadataItem.GrandparentGuid
+			} else if metadataItem.ParentThumb != "" {
+				thumbPath = metadataItem.ParentThumb
+				lookupGuid = metadataItem.ParentGuid
+			} else {
+				thumbPath = metadataItem.GrandparentThumb
+				lookupGuid = metadataItem.GrandparentGuid
+			}
+		default:
+			thumbPath = metadataItem.Thumb
+			lookupGuid = metadataItem.Guid
 		}
 
-		var baseURL = parsed.Scheme + "://" + parsed.Host
-
-		req, e := http.NewRequest("GET", "https://clients.plex.tv/api/v2/resources?includeHttps=1", nil)
-		if e != nil {
-			return
-		}
-
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("X-Plex-Product", largeImageText)
-		req.Header.Set("X-Plex-Token", plexUAT)
-		req.Header.Set("X-Plex-Client-Identifier", plexClientID)
-
-		res, e := http.DefaultClient.Do(req)
-		if e != nil {
-			return
-		}
-
-		defer res.Body.Close()
-
-		var response []plexResource
-		e = json.NewDecoder(res.Body).Decode(&response)
-		if e != nil {
-			return
-		}
-
-		var token = ""
-		for i := range response {
-			if strings.Contains(response[i].Provides, "server") {
-				if strings.Contains(metadataItem.ServerEntityID, response[i].ClientIdentifier) {
-					token = response[i].AccessToken
-					break
+		if thumbPath != "" {
+			var publicThumbURL = getPublicThumbURL(lookupGuid, plexUAT, plexClientID)
+			if publicThumbURL != "" {
+				info.thumbURL = publicThumbURL
+			} else {
+				// litterbox fallback
+				parsed, e := url.Parse(media.URL)
+				if e != nil {
+					return
 				}
+				var baseURL = parsed.Scheme + "://" + parsed.Host
 
-				for _, c := range response[i].Connections {
-					u, _ := url.Parse(c.URI)
-					if u.Host == parsed.Host {
-						token = response[i].AccessToken
-						break
+				var token = getMediaServerToken(media, plexUAT, plexClientID, parsed.Host)
+
+				var imageURL = ""
+				if token != "" {
+					switch metadataItem.Type {
+					case "episode":
+						if metadataItem.ParentThumb != "" {
+							imageURL = baseURL + metadataItem.ParentThumb + "?X-Plex-Token=" + token
+						} else if metadataItem.GrandparentThumb != "" {
+							imageURL = baseURL + metadataItem.GrandparentThumb + "?X-Plex-Token=" + token
+						}
+					case "movie":
+						if metadataItem.Thumb != "" {
+							imageURL = baseURL + metadataItem.Thumb + "?X-Plex-Token=" + token
+						}
+					default:
+						if metadataItem.Thumb != "" {
+							imageURL = baseURL + metadataItem.Thumb + "?X-Plex-Token=" + token
+						}
 					}
 				}
 
-				if token != "" {
-					break
-				}
-			}
-		}
-
-		var imageURL = ""
-
-		if token != "" {
-			switch metadataItem.Type {
-			case "episode":
-				if metadataItem.ParentThumb != "" {
-					imageURL = baseURL + metadataItem.ParentThumb + "?X-Plex-Token=" + token
-				} else if metadataItem.GrandparentThumb != "" {
-					imageURL = baseURL + metadataItem.GrandparentThumb + "?X-Plex-Token=" + token
-				}
-			case "movie":
-				if metadataItem.Thumb != "" {
-					imageURL = baseURL + metadataItem.Thumb + "?X-Plex-Token=" + token
-				}
-			default:
-				if metadataItem.Thumb != "" {
-					imageURL = baseURL + metadataItem.Thumb + "?X-Plex-Token=" + token
-				}
-			}
-		}
-
-		if imageURL != "" {
-			if imageURL == globalSourceURL && !globalExp.IsZero() && time.Now().Before(globalExp) {
-				info.thumbURL = globalLitterboxURL
-			} else {
-				uploadedURL, expiration, err := UploadToLitterbox(imageURL, "12h")
-				if err != nil {
-					fmt.Println("Failed to upload to Litterbox:", err)
-				} else {
-					info.thumbURL = uploadedURL
-					globalLitterboxURL = uploadedURL
-					globalSourceURL = imageURL
-					globalExp = expiration
+				if imageURL != "" {
+					if imageURL == globalSourceURL && !globalExp.IsZero() && time.Now().Before(globalExp) {
+						info.thumbURL = globalLitterboxURL
+					} else {
+						uploadedURL, expiration, err := UploadToLitterbox(imageURL, "12h")
+						if err != nil {
+							fmt.Println("Failed to upload to Litterbox:", err)
+						} else {
+							info.thumbURL = uploadedURL
+							globalLitterboxURL = uploadedURL
+							globalSourceURL = imageURL
+							globalExp = expiration
+						}
+					}
 				}
 			}
 		}
 	}
-
 	return
 }
 
